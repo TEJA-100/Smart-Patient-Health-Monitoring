@@ -1,0 +1,320 @@
+#include <WiFi.h>
+#include <WebServer.h>
+
+// ================= Wi-Fi Credentials =================
+const char* ssid     = "YOUR_WIFI_SSID";       // Put your 2.4GHz Wi-Fi name here
+const char* password = "YOUR_WIFI_PASSWORD";   // Put your Wi-Fi password here
+
+// ================= Pin Assignments =================
+#define PULSE_PIN    34   // SEN-11574 Signal pin (ADC1)
+#define LM35_AMP_PIN 35   // LM741 Pin 6 Output (ADC1)
+#define BUZZER_PIN   25   // Buzzer Positive pin
+
+// ================= Normal Health Thresholds =================
+const float TEMP_NORMAL_MIN = 36.0;    // °C
+const float TEMP_NORMAL_MAX = 37.8;    // °C
+const float BPM_NORMAL_MIN  = 60.0;    // BPM
+const float BPM_NORMAL_MAX  = 100.0;   // BPM
+
+// ================= Global Variables =================
+WebServer server(80);
+bool wifiConnected = false;
+
+int rawPulse = 0;
+bool pulseDetected = false;
+unsigned long lastBeatTime = 0;
+float currentBPM = 0;
+float smoothedBPM = 0;
+float temperatureC = 0.0;
+String healthStatus = "WAITING";
+
+// Dynamic Peak Tracking for BPM
+int peak = 2048;
+int trough = 2048;
+int dynamicThreshold = 2048;
+int amplitude = 0;
+unsigned long lastAdaptTime = 0;
+
+unsigned long lastTempTime = 0;
+unsigned long lastBuzzerCheck = 0;
+
+// ================= NORMAL BUZZER ALARMS =================
+
+// 1. GOOD CONDITION: 2 short, crisp pleasant confirmation beeps
+void playGoodTune() {
+  tone(BUZZER_PIN, 2000, 70);
+  delay(90);
+  noTone(BUZZER_PIN);
+  delay(60);
+  tone(BUZZER_PIN, 2500, 100);
+  delay(120);
+  noTone(BUZZER_PIN);
+}
+
+// 2. BAD CONDITION: Standard urgent medical monitor warning (3 sharp beeps)
+void playBadTune() {
+  for (int i = 0; i < 3; i++) {
+    tone(BUZZER_PIN, 2700, 90);
+    delay(110);
+    noTone(BUZZER_PIN);
+    delay(50);
+  }
+}
+
+// ================= Colorful Web Dashboard =================
+const char PAGE_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Smart Health Monitor</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 50%, #f77062 100%);
+      color: #ffffff;
+      margin: 0;
+      padding: 25px;
+      min-height: 100vh;
+      text-align: center;
+    }
+    .header-box {
+      background: rgba(255, 255, 255, 0.2);
+      backdrop-filter: blur(10px);
+      border-radius: 20px;
+      padding: 15px 25px;
+      max-width: 650px;
+      margin: 0 auto 25px auto;
+      border: 1px solid rgba(255, 255, 255, 0.4);
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.2);
+    }
+    h1 { font-size: 26px; margin: 5px 0; letter-spacing: 1px; }
+    p.sub { margin: 0; font-size: 14px; color: #ffe8d6; }
+    .grid { display: flex; flex-wrap: wrap; justify-content: center; gap: 20px; max-width: 650px; margin: 0 auto; }
+    .card {
+      border-radius: 22px;
+      padding: 25px 20px;
+      flex: 1 1 220px;
+      box-shadow: 0 10px 25px rgba(0,0,0,0.25);
+      border: 2px solid rgba(255,255,255,0.4);
+    }
+    .card.heart { background: linear-gradient(135deg, #ff416c, #ff4b2b); }
+    .card.temp { background: linear-gradient(135deg, #00b4db, #0083b0); }
+    .status-card { flex-basis: 100%; background: rgba(255, 255, 255, 0.25); backdrop-filter: blur(8px); }
+    .icon { font-size: 32px; margin-bottom: 5px; }
+    .title { font-size: 13px; font-weight: 800; letter-spacing: 1.5px; text-transform: uppercase; }
+    .val { font-size: 50px; font-weight: 900; margin: 8px 0; }
+    .unit { font-size: 16px; font-weight: 700; opacity: 0.85; }
+    .badge { display: inline-block; padding: 12px 30px; border-radius: 40px; font-size: 19px; font-weight: 800; margin-top: 10px; }
+    .good { background: linear-gradient(135deg, #11998e, #38ef7d); border: 2px solid #ffffff; }
+    .bad { background: linear-gradient(135deg, #eb3349, #f45c43); border: 2px solid #ffffff; animation: pulse 0.7s infinite alternate; }
+    .wait { background: rgba(0, 0, 0, 0.35); border: 1px solid rgba(255,255,255,0.4); }
+    @keyframes pulse { from { transform: scale(1); } to { transform: scale(1.05); } }
+  </style>
+</head>
+<body>
+  <div class="header-box">
+    <h1>HEALTH MONITORING SYSTEM</h1>
+    <p class="sub">SEN-11574 &bull; LM35 + LM741 &bull; Auto-Tuning BPM</p>
+  </div>
+
+  <div class="grid">
+    <div class="card heart">
+      <div class="icon">&#10084;&#65039;</div>
+      <div class="title">HEART RATE</div>
+      <div class="val" id="bpm">--</div>
+      <div class="unit">BPM</div>
+    </div>
+    
+    <div class="card temp">
+      <div class="icon">&#127777;&#65039;</div>
+      <div class="title">TEMPERATURE</div>
+      <div class="val" id="temp">--</div>
+      <div class="unit">&deg;C</div>
+    </div>
+
+    <div class="card status-card">
+      <div class="title">LIVE CONDITION STATUS</div>
+      <div id="badge-container"><span class="badge wait">PLACE FINGER ON SENSOR...</span></div>
+    </div>
+  </div>
+
+  <script>
+    setInterval(function() {
+      fetch('/data')
+        .then(res => res.json())
+        .then(d => {
+          document.getElementById('bpm').innerText = d.bpm > 30 ? Math.round(d.bpm) : "--";
+          document.getElementById('temp').innerText = d.temp > 0 ? d.temp.toFixed(1) : "--";
+          
+          let container = document.getElementById('badge-container');
+          if (d.status === "GOOD") {
+            container.innerHTML = '<span class="badge good">&#10004; CONDITION NORMAL</span>';
+          } else if (d.status === "BAD") {
+            container.innerHTML = '<span class="badge bad">&#9888; CRITICAL ALERT!</span>';
+          } else {
+            container.innerHTML = '<span class="badge wait">MEASURING...</span>';
+          }
+        })
+        .catch(err => console.error(err));
+    }, 1000);
+  </script>
+</body>
+</html>
+)rawliteral";
+
+// ================= Web Handlers =================
+void handleRoot() {
+  server.send(200, "text/html", PAGE_HTML);
+}
+
+void handleData() {
+  String json = "{";
+  json += "\"bpm\":" + String(smoothedBPM, 1) + ",";
+  json += "\"temp\":" + String(temperatureC, 2) + ",";
+  json += "\"status\":\"" + healthStatus + "\"";
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+// ================= Read LM35 through LM741 (3x Gain) =================
+float readTemperature() {
+  long sumMilliVolts = 0;
+  for (int i = 0; i < 20; i++) {
+    sumMilliVolts += analogReadMilliVolts(LM35_AMP_PIN);
+    delay(2);
+  }
+  float avgMilliVolts = (float)sumMilliVolts / 20.0;
+  return avgMilliVolts / 30.0;
+}
+
+void setup() {
+  // Start Serial Monitor immediately
+  Serial.begin(115200);
+  delay(1500); // Allow USB-Serial connection to stabilize
+  Serial.println("\n=========================================");
+  Serial.println("  ESP32 HEALTH MONITOR INITIALIZING...   ");
+  Serial.println("=========================================");
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  analogReadResolution(12);
+
+  // Power-on test beep
+  tone(BUZZER_PIN, 2000, 80);
+  delay(100);
+  noTone(BUZZER_PIN);
+
+  // Wi-Fi Connection with 10-Second Timeout
+  Serial.print("Connecting to Wi-Fi: ");
+  Serial.println(ssid);
+  WiFi.begin(ssid, password);
+
+  unsigned long wifiStart = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - wifiStart < 10000)) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiConnected = true;
+    Serial.println("\n[OK] WiFi Connected!");
+    Serial.print("[INFO] Dashboard URL: http://");
+    Serial.println(WiFi.localIP());
+
+    server.on("/", handleRoot);
+    server.on("/data", handleData);
+    server.begin();
+  } else {
+    Serial.println("\n[WARN] WiFi connection timed out (Wrong SSID/Password or out of range).");
+    Serial.println("[INFO] Running in Serial-Only Mode without freezing!");
+  }
+
+  Serial.println("=========================================\n");
+}
+
+void loop() {
+  if (wifiConnected) {
+    server.handleClient();
+  }
+
+  // 1. Read SEN-11574 Pulse Sensor
+  rawPulse = analogRead(PULSE_PIN);
+
+  // Auto-track Peak and Valley
+  if (rawPulse > peak) peak = rawPulse;
+  if (rawPulse < trough) trough = rawPulse;
+
+  // Adapt threshold every 600ms
+  if (millis() - lastAdaptTime > 600) {
+    lastAdaptTime = millis();
+    amplitude = peak - trough;
+    dynamicThreshold = trough + (amplitude / 2);
+
+    peak -= (amplitude * 0.2);
+    trough += (amplitude * 0.2);
+  }
+
+  // Beat Detection
+  if (amplitude > 80) {
+    if (rawPulse > dynamicThreshold && !pulseDetected && (millis() - lastBeatTime > 300)) {
+      pulseDetected = true;
+      unsigned long delta = millis() - lastBeatTime;
+      lastBeatTime = millis();
+
+      currentBPM = 60000.0 / delta;
+      if (currentBPM >= 50.0 && currentBPM <= 190.0) {
+        if (smoothedBPM == 0) smoothedBPM = currentBPM;
+        else smoothedBPM = (smoothedBPM * 0.65) + (currentBPM * 0.35);
+      }
+    }
+
+    if (rawPulse < (dynamicThreshold - 30)) {
+      pulseDetected = false;
+    }
+  }
+
+  // Clear BPM if finger is removed
+  if (millis() - lastBeatTime > 3500) {
+    smoothedBPM = 0;
+  }
+
+  // 2. Read Temperature & Print to Serial Monitor every 1 second
+  if (millis() - lastTempTime >= 1000) {
+    lastTempTime = millis();
+    temperatureC = readTemperature();
+
+    // Check health condition
+    if (smoothedBPM > 0) {
+      bool isTempNormal = (temperatureC >= TEMP_NORMAL_MIN && temperatureC <= TEMP_NORMAL_MAX);
+      bool isBpmNormal  = (smoothedBPM >= BPM_NORMAL_MIN && smoothedBPM <= BPM_NORMAL_MAX);
+
+      if (isTempNormal && isBpmNormal) {
+        healthStatus = "GOOD";
+      } else {
+        healthStatus = "BAD";
+      }
+    } else {
+      healthStatus = "WAITING";
+    }
+
+    // Always print to Serial Monitor
+    Serial.print("Raw Pulse: "); Serial.print(rawPulse);
+    Serial.print(" | Threshold: "); Serial.print(dynamicThreshold);
+    Serial.print(" | BPM: "); Serial.print(smoothedBPM > 0 ? String(smoothedBPM, 0) : "--");
+    Serial.print(" | Temp: "); Serial.print(temperatureC, 1);
+    Serial.print(" °C | Status: "); Serial.println(healthStatus);
+  }
+
+  // 3. Play Normal Buzzer Alarms every 4 seconds based on status
+  if (millis() - lastBuzzerCheck >= 4000) {
+    lastBuzzerCheck = millis();
+    if (healthStatus == "GOOD") {
+      playGoodTune(); // 2 short pleasant beeps
+    } else if (healthStatus == "BAD") {
+      playBadTune();  // 3 urgent medical alert beeps
+    }
+  }
+
+  delay(15);
+}
