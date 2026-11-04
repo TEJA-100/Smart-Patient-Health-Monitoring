@@ -1,9 +1,16 @@
 #include <WiFi.h>
 #include <WebServer.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
 
 // ================= Wi-Fi Credentials =================
-const char* ssid     = "YOUR_WIFI_SSID";       // Put your 2.4GHz Wi-Fi name here
-const char* password = "YOUR_WIFI_PASSWORD";   // Put your Wi-Fi password here
+const char* ssid     = "MATRIX";       // Put your 2.4GHz Wi-Fi name here
+const char* password = "123456789";   // Put your Wi-Fi password here
+
+// ================= Telegram Bot Settings =================
+const char* BOT_TOKEN = "8889632772:AAGZWy-ep9kcdYolWiN9wGeCsHYxFLOvsHU";  // New token from @BotFather (after /revoke)
+const char* CHAT_ID   = "7283664397";          // Your Chat ID
+const unsigned long TELEGRAM_INTERVAL = 40000; // Send update every 40 seconds
 
 // ================= Pin Assignments =================
 #define PULSE_PIN    34   // SEN-11574 Signal pin (ADC1)
@@ -11,10 +18,10 @@ const char* password = "YOUR_WIFI_PASSWORD";   // Put your Wi-Fi password here
 #define BUZZER_PIN   25   // Buzzer Positive pin
 
 // ================= Normal Health Thresholds =================
-const float TEMP_NORMAL_MIN = 36.0;    // °C
-const float TEMP_NORMAL_MAX = 37.8;    // °C
+const float TEMP_NORMAL_MIN = 40.0;    // °C
+const float TEMP_NORMAL_MAX = 98.0;    // °C
 const float BPM_NORMAL_MIN  = 60.0;    // BPM
-const float BPM_NORMAL_MAX  = 100.0;   // BPM
+const float BPM_NORMAL_MAX  = 120.0;   // BPM
 
 // ================= Global Variables =================
 WebServer server(80);
@@ -26,7 +33,7 @@ unsigned long lastBeatTime = 0;
 float currentBPM = 0;
 float smoothedBPM = 0;
 float temperatureC = 0.0;
-String healthStatus = "WAITING";
+String healthStatus = "MEASURING";   // MEASURING / NORMAL / ABNORMAL
 
 // Dynamic Peak Tracking for BPM
 int peak = 2048;
@@ -37,10 +44,67 @@ unsigned long lastAdaptTime = 0;
 
 unsigned long lastTempTime = 0;
 unsigned long lastBuzzerCheck = 0;
+unsigned long lastTelegramTime = 0;
+
+// ================= Graph Data Buffer (for dashboard) =================
+// Last 60 seconds of BPM and Temperature (1 sample per second)
+const int HIST = 60;
+float bpmHist[HIST];
+float tempHist[HIST];
+int histHead = 0;
+int histCount = 0;
+
+// ================= TELEGRAM FUNCTIONS =================
+String urlEncode(const String &s) {
+  String out = "";
+  char buf[4];
+  for (size_t i = 0; i < s.length(); i++) {
+    char c = s[i];
+    if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+      out += c;
+    } else {
+      snprintf(buf, sizeof(buf), "%%%02X", (unsigned char)c);
+      out += buf;
+    }
+  }
+  return out;
+}
+
+bool sendTelegramMessage(const String &text) {
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  WiFiClientSecure client;
+  client.setInsecure();   // skips certificate check (fine for a school project)
+
+  HTTPClient https;
+  String url = "https://api.telegram.org/bot" + String(BOT_TOKEN) +
+               "/sendMessage?chat_id=" + String(CHAT_ID) +
+               "&text=" + urlEncode(text);
+
+  if (!https.begin(client, url)) return false;
+  int code = https.GET();
+  https.end();
+
+  Serial.print("[Telegram] Response code: ");
+  Serial.println(code);
+  return code == 200;
+}
+
+void sendHealthUpdate() {
+  String bpmText = (smoothedBPM > 0) ? String((int)smoothedBPM) : "--";
+
+  String msg = "❤️ Patient Health Update\n";
+  msg += "Heart Rate: " + bpmText + " BPM\n";
+  msg += "Temperature: " + String(temperatureC, 1) + " °C\n";
+  msg += "Status: " + healthStatus + "\n";
+  msg += "📊 Live Dashboard, Graphs & Analysis\n";
+  msg += "http://" + WiFi.localIP().toString() + "/";
+  sendTelegramMessage(msg);
+}
 
 // ================= NORMAL BUZZER ALARMS =================
 
-// 1. GOOD CONDITION: 2 short, crisp pleasant confirmation beeps
+// 1. NORMAL CONDITION: 2 short, crisp pleasant confirmation beeps
 void playGoodTune() {
   tone(BUZZER_PIN, 2000, 70);
   delay(90);
@@ -51,7 +115,7 @@ void playGoodTune() {
   noTone(BUZZER_PIN);
 }
 
-// 2. BAD CONDITION: Standard urgent medical monitor warning (3 sharp beeps)
+// 2. ABNORMAL CONDITION: Standard urgent medical monitor warning (3 sharp beeps)
 void playBadTune() {
   for (int i = 0; i < 3; i++) {
     tone(BUZZER_PIN, 2700, 90);
@@ -61,105 +125,400 @@ void playBadTune() {
   }
 }
 
-// ================= Colorful Web Dashboard =================
+// ================= Web Dashboard =================
 const char PAGE_HTML[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
+  <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Smart Health Monitor</title>
+  <title>Smart Patient Health Monitoring System</title>
   <style>
+    :root {
+      --bg: #0b1220;
+      --card: #162033;
+      --line: rgba(255,255,255,0.09);
+      --text: #e8eefc;
+      --muted: #8fa0c0;
+      --green: #2ee59d;
+      --red: #ff5d6c;
+      --amber: #ffc857;
+      --blue: #4cc9f0;
+    }
     * { box-sizing: border-box; }
     body {
-      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-      background: linear-gradient(135deg, #667eea 0%, #764ba2 50%, #f77062 100%);
-      color: #ffffff;
       margin: 0;
-      padding: 25px;
+      padding: 22px 16px 40px;
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      background: radial-gradient(1200px 600px at 20% -10%, #1b2a4a 0%, var(--bg) 60%);
+      color: var(--text);
       min-height: 100vh;
+    }
+    .wrap { max-width: 1000px; margin: 0 auto; }
+
+    /* ---------- 1. TITLE ---------- */
+    .header {
       text-align: center;
-    }
-    .header-box {
-      background: rgba(255, 255, 255, 0.2);
-      backdrop-filter: blur(10px);
+      padding: 22px 16px;
       border-radius: 20px;
-      padding: 15px 25px;
-      max-width: 650px;
-      margin: 0 auto 25px auto;
-      border: 1px solid rgba(255, 255, 255, 0.4);
-      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.2);
+      background: linear-gradient(135deg, #243b6b 0%, #5b2a86 55%, #b83a5e 100%);
+      box-shadow: 0 12px 30px rgba(0,0,0,0.35);
+      margin-bottom: 20px;
     }
-    h1 { font-size: 26px; margin: 5px 0; letter-spacing: 1px; }
-    p.sub { margin: 0; font-size: 14px; color: #ffe8d6; }
-    .grid { display: flex; flex-wrap: wrap; justify-content: center; gap: 20px; max-width: 650px; margin: 0 auto; }
-    .card {
-      border-radius: 22px;
-      padding: 25px 20px;
-      flex: 1 1 220px;
-      box-shadow: 0 10px 25px rgba(0,0,0,0.25);
-      border: 2px solid rgba(255,255,255,0.4);
+    .header h1 { margin: 0; font-size: 26px; letter-spacing: 1.5px; }
+    .header p { margin: 8px 0 0; font-size: 13px; color: #dbe4ff; opacity: 0.9; }
+    .live { display: inline-flex; align-items: center; gap: 7px; margin-top: 12px;
+            font-size: 12px; font-weight: 700; letter-spacing: 1px;
+            background: rgba(0,0,0,0.25); padding: 5px 12px; border-radius: 20px; }
+    .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--green);
+           box-shadow: 0 0 8px var(--green); animation: blink 1.4s infinite; }
+    .dot.off { background: var(--red); box-shadow: 0 0 8px var(--red); animation: none; }
+    @keyframes blink { 50% { opacity: 0.35; } }
+
+    /* ---------- 2. TWO CARDS ---------- */
+    .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 18px; }
+    .metric {
+      border-radius: 20px; padding: 22px 20px; text-align: center;
+      box-shadow: 0 10px 26px rgba(0,0,0,0.3);
+      border: 1px solid rgba(255,255,255,0.18);
     }
-    .card.heart { background: linear-gradient(135deg, #ff416c, #ff4b2b); }
-    .card.temp { background: linear-gradient(135deg, #00b4db, #0083b0); }
-    .status-card { flex-basis: 100%; background: rgba(255, 255, 255, 0.25); backdrop-filter: blur(8px); }
-    .icon { font-size: 32px; margin-bottom: 5px; }
-    .title { font-size: 13px; font-weight: 800; letter-spacing: 1.5px; text-transform: uppercase; }
-    .val { font-size: 50px; font-weight: 900; margin: 8px 0; }
-    .unit { font-size: 16px; font-weight: 700; opacity: 0.85; }
-    .badge { display: inline-block; padding: 12px 30px; border-radius: 40px; font-size: 19px; font-weight: 800; margin-top: 10px; }
-    .good { background: linear-gradient(135deg, #11998e, #38ef7d); border: 2px solid #ffffff; }
-    .bad { background: linear-gradient(135deg, #eb3349, #f45c43); border: 2px solid #ffffff; animation: pulse 0.7s infinite alternate; }
-    .wait { background: rgba(0, 0, 0, 0.35); border: 1px solid rgba(255,255,255,0.4); }
+    .metric.bpm  { background: linear-gradient(135deg, #ff416c, #ff4b2b); }
+    .metric.temp { background: linear-gradient(135deg, #0099cc, #0066aa); }
+    .metric .label { font-size: 13px; font-weight: 800; letter-spacing: 2px; }
+    .metric .icon { font-size: 30px; margin-bottom: 4px; }
+    .metric .value { font-size: 58px; font-weight: 900; line-height: 1.1; margin: 8px 0 2px; }
+    .metric .unit { font-size: 16px; font-weight: 700; opacity: 0.9; }
+    .metric .range { margin-top: 10px; font-size: 12px; opacity: 0.85; }
+
+    /* ---------- 3. STATUS ---------- */
+    .status {
+      margin-top: 18px; border-radius: 20px; padding: 22px 18px; text-align: center;
+      background: var(--card); border: 1px solid var(--line);
+      box-shadow: 0 10px 26px rgba(0,0,0,0.3);
+    }
+    .status .label { font-size: 13px; font-weight: 800; letter-spacing: 2px; color: var(--muted); }
+    .badge {
+      display: inline-block; margin-top: 12px; padding: 14px 38px; border-radius: 50px;
+      font-size: 22px; font-weight: 900; letter-spacing: 1px; border: 2px solid #fff;
+    }
+    .badge.normal   { background: linear-gradient(135deg, #11998e, #38ef7d); color: #04251c; }
+    .badge.abnormal { background: linear-gradient(135deg, #eb3349, #f45c43); animation: pulse 0.8s infinite alternate; }
+    .badge.measuring { background: rgba(255,255,255,0.10); border-color: rgba(255,255,255,0.35); color: #cfd9f2; }
     @keyframes pulse { from { transform: scale(1); } to { transform: scale(1.05); } }
+    .status .hint { margin-top: 12px; font-size: 14px; color: var(--muted); }
+
+    /* ---------- 4. GRAPHS ---------- */
+    .section-title { margin: 28px 0 12px; font-size: 14px; font-weight: 800;
+                     letter-spacing: 2px; color: var(--muted); text-transform: uppercase; }
+    .graphs { display: grid; grid-template-columns: repeat(auto-fit, minmax(380px, 1fr)); gap: 18px; }
+    .panel {
+      background: var(--card); border: 1px solid var(--line); border-radius: 20px;
+      padding: 16px; box-shadow: 0 10px 26px rgba(0,0,0,0.3);
+    }
+    .panel h3 { margin: 0 0 4px; font-size: 15px; display: flex; justify-content: space-between; align-items: center; }
+    .panel h3 .now { font-size: 14px; font-weight: 700; padding: 3px 10px; border-radius: 12px; background: rgba(255,255,255,0.08); }
+    .panel .sub { font-size: 12px; color: var(--muted); margin-bottom: 8px; }
+    canvas { width: 100%; height: 220px; display: block; }
+
+    /* ---------- 5. ANALYSIS ---------- */
+    .analysis { display: grid; grid-template-columns: repeat(auto-fit, minmax(380px, 1fr)); gap: 18px; }
+    .stat-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-top: 10px; }
+    .stat { background: rgba(255,255,255,0.05); border-radius: 14px; padding: 10px 6px; text-align: center; }
+    .stat .k { font-size: 11px; color: var(--muted); letter-spacing: 1px; text-transform: uppercase; }
+    .stat .v { font-size: 22px; font-weight: 800; margin-top: 2px; }
+    .bar { height: 12px; border-radius: 8px; overflow: hidden; display: flex; margin-top: 14px; background: rgba(255,255,255,0.08); }
+    .bar span { display: block; height: 100%; }
+    .bar .lo { background: var(--blue); }
+    .bar .ok { background: var(--green); }
+    .bar .hi { background: var(--red); }
+    .legend { display: flex; justify-content: space-between; font-size: 12px; margin-top: 8px; color: var(--muted); }
+    .legend b { color: var(--text); }
+
+    /* ---------- 6. RECENT READINGS ---------- */
+    .table-wrap { max-height: 300px; overflow-y: auto; border-radius: 14px; }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    th, td { padding: 9px 8px; text-align: center; border-bottom: 1px solid var(--line); }
+    th { position: sticky; top: 0; background: #1d2a45; font-size: 11px; letter-spacing: 1px;
+         text-transform: uppercase; color: var(--muted); }
+    .chip { display: inline-block; padding: 3px 10px; border-radius: 12px; font-size: 11px; font-weight: 800; }
+    .chip.normal { background: rgba(46,229,157,0.18); color: var(--green); }
+    .chip.abnormal { background: rgba(255,93,108,0.2); color: var(--red); }
+    .chip.measuring { background: rgba(255,255,255,0.1); color: var(--muted); }
+
+    .footer { text-align: center; margin-top: 26px; font-size: 12px; color: var(--muted); line-height: 1.7; }
   </style>
 </head>
 <body>
-  <div class="header-box">
-    <h1>HEALTH MONITORING SYSTEM</h1>
-    <p class="sub">SEN-11574 &bull; LM35 + LM741 &bull; Auto-Tuning BPM</p>
+<div class="wrap">
+
+  <!-- 1. TITLE -->
+  <div class="header">
+    <h1>SMART PATIENT HEALTH MONITORING SYSTEM</h1>
+    <p>ESP32 &bull; Pulse Sensor &bull; LM35 (Temp) + LM741 &bull; Telegram Alerts</p>
+    <div class="live"><span class="dot" id="liveDot"></span><span id="liveText">LIVE</span></div>
   </div>
 
-  <div class="grid">
-    <div class="card heart">
+  <!-- 2. TWO CARDS -->
+  <div class="cards">
+    <div class="metric bpm">
       <div class="icon">&#10084;&#65039;</div>
-      <div class="title">HEART RATE</div>
-      <div class="val" id="bpm">--</div>
+      <div class="label">HEART RATE</div>
+      <div class="value" id="bpm">--</div>
       <div class="unit">BPM</div>
+      <div class="range">Normal range: 60 &ndash; 120 BPM</div>
     </div>
-    
-    <div class="card temp">
+    <div class="metric temp">
       <div class="icon">&#127777;&#65039;</div>
-      <div class="title">TEMPERATURE</div>
-      <div class="val" id="temp">--</div>
+      <div class="label">SIMULATED TEMPERATURE</div>
+      <div class="value" id="temp">--</div>
       <div class="unit">&deg;C</div>
-    </div>
-
-    <div class="card status-card">
-      <div class="title">LIVE CONDITION STATUS</div>
-      <div id="badge-container"><span class="badge wait">PLACE FINGER ON SENSOR...</span></div>
+      <div class="range">Normal range: 40.0 &ndash; 98.0 &deg;C</div>
     </div>
   </div>
 
-  <script>
-    setInterval(function() {
-      fetch('/data')
-        .then(res => res.json())
-        .then(d => {
-          document.getElementById('bpm').innerText = d.bpm > 30 ? Math.round(d.bpm) : "--";
-          document.getElementById('temp').innerText = d.temp > 0 ? d.temp.toFixed(1) : "--";
-          
-          let container = document.getElementById('badge-container');
-          if (d.status === "GOOD") {
-            container.innerHTML = '<span class="badge good">&#10004; CONDITION NORMAL</span>';
-          } else if (d.status === "BAD") {
-            container.innerHTML = '<span class="badge bad">&#9888; CRITICAL ALERT!</span>';
-          } else {
-            container.innerHTML = '<span class="badge wait">MEASURING...</span>';
-          }
-        })
-        .catch(err => console.error(err));
-    }, 1000);
-  </script>
+  <!-- 3. STATUS (below the two cards) -->
+  <div class="status">
+    <div class="label">SYSTEM STATUS</div>
+    <div id="badgeBox"><span class="badge measuring">MEASURING...</span></div>
+    <div class="hint" id="hint">Place your finger on the pulse sensor</div>
+  </div>
+
+  <!-- 4. TWO SEPARATE GRAPHS -->
+  <div class="section-title">Graphs &mdash; Last 60 Seconds</div>
+  <div class="graphs">
+    <div class="panel">
+      <h3>&#10084;&#65039; Heart Rate (BPM) <span class="now" id="bpmNow">-- BPM</span></h3>
+      <div class="sub">Green band = normal range (60&ndash;100 BPM)</div>
+      <canvas id="bpmChart"></canvas>
+    </div>
+    <div class="panel">
+      <h3>&#127777;&#65039; Simulated Temperature (&deg;C) <span class="now" id="tempNow">-- &deg;C</span></h3>
+      <div class="sub">Green band = normal range (36.0&ndash;37.8 &deg;C)</div>
+      <canvas id="tempChart"></canvas>
+    </div>
+  </div>
+
+  <!-- 5. ANALYSIS -->
+  <div class="section-title">Analysis &mdash; Last 60 Seconds</div>
+  <div class="analysis">
+    <div class="panel">
+      <h3>&#10084;&#65039; Heart Rate Analysis</h3>
+      <div id="bpmStats"><div class="sub">Collecting data...</div></div>
+    </div>
+    <div class="panel">
+      <h3>&#127777;&#65039; Temperature Analysis</h3>
+      <div id="tempStats"><div class="sub">Collecting data...</div></div>
+    </div>
+  </div>
+
+  <!-- 6. RECENT READINGS -->
+  <div class="section-title">Recent Readings &mdash; Last 30 Seconds</div>
+  <div class="panel">
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Time</th><th>BPM</th><th>Temp (&deg;C)</th><th>Status</th></tr></thead>
+        <tbody id="readings"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="footer">
+    DEMO ONLY: Temperature values are simulated (70–105 °C), not real body readings.<br>Telegram bot sends an update every 40 seconds.<br>
+    Graphs and analysis refresh automatically. Readings are not a medical diagnosis.
+  </div>
+</div>
+
+<script>
+  // Normal ranges (same as in the ESP32 code)
+  const BPM_MIN = 60, BPM_MAX = 100, TEMP_MIN = 36.0, TEMP_MAX = 37.8;
+  const HIST = 60;
+  let lastHist = null;
+
+  function setText(id, t) { document.getElementById(id).innerText = t; }
+
+  // ---------- Graph drawing ----------
+  function drawChart(id, data, o) {
+    const c = document.getElementById(id);
+    const dpr = window.devicePixelRatio || 1;
+    const w = c.clientWidth, h = c.clientHeight;
+    if (!w || !h) return;
+    if (c.width !== Math.round(w * dpr) || c.height !== Math.round(h * dpr)) {
+      c.width = Math.round(w * dpr);
+      c.height = Math.round(h * dpr);
+    }
+    const ctx = c.getContext('2d');
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+
+    const L = 42, R = 16, T = 16, B = 26;
+    const pw = w - L - R, ph = h - T - B;
+    const yOf = v => T + ph - Math.max(0, Math.min(1, (v - o.lo) / (o.hi - o.lo))) * ph;
+    const xOf = i => L + pw - (data.length - 1 - i) * (pw / (HIST - 1));
+
+    // normal range band
+    ctx.fillStyle = 'rgba(46,229,157,0.12)';
+    ctx.fillRect(L, yOf(o.okMax), pw, yOf(o.okMin) - yOf(o.okMax));
+
+    // grid + y labels
+    ctx.font = '11px sans-serif';
+    ctx.strokeStyle = 'rgba(255,255,255,0.09)';
+    ctx.lineWidth = 1;
+    ctx.fillStyle = '#8fa0c0';
+    ctx.textAlign = 'right';
+    for (let i = 0; i <= 4; i++) {
+      const v = o.lo + (o.hi - o.lo) * i / 4;
+      const y = yOf(v);
+      ctx.beginPath(); ctx.moveTo(L, y); ctx.lineTo(L + pw, y); ctx.stroke();
+      ctx.fillText(v.toFixed(o.axisDec), L - 6, y + 4);
+    }
+
+    // x labels
+    ctx.textAlign = 'left';  ctx.fillText('60s ago', L, h - 7);
+    ctx.textAlign = 'right'; ctx.fillText('now', L + pw, h - 7);
+
+    // data line
+    ctx.strokeStyle = o.color;
+    ctx.lineWidth = 2.5;
+    ctx.lineJoin = 'round';
+    ctx.beginPath();
+    let started = false;
+    for (let i = 0; i < data.length; i++) {
+      const v = data[i];
+      if (v < o.minValid) { started = false; continue; }
+      const x = xOf(i), y = yOf(v);
+      if (!started) { ctx.moveTo(x, y); started = true; } else { ctx.lineTo(x, y); }
+    }
+    ctx.stroke();
+
+    // value labels (every 5th point, counted back from the latest)
+    ctx.font = 'bold 12px sans-serif';
+    for (let i = 0; i < data.length; i++) {
+      const v = data[i];
+      if (v < o.minValid) continue;
+      if ((data.length - 1 - i) % 5 !== 0) continue;
+      const x = xOf(i), y = yOf(v);
+      ctx.fillStyle = o.color;
+      ctx.beginPath(); ctx.arc(x, y, 3.5, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = '#ffffff';
+      ctx.textAlign = x > w - 28 ? 'right' : (x < L + 12 ? 'left' : 'center');
+      ctx.fillText(v.toFixed(o.dec), x, y < T + 14 ? y + 18 : y - 8);
+    }
+    ctx.textAlign = 'left';
+  }
+
+  // ---------- Analysis ----------
+  function analyse(arr, minValid, okMin, okMax) {
+    const v = arr.filter(x => x >= minValid);
+    if (v.length === 0) return null;
+    const n = v.length;
+    const sum = v.reduce((a, b) => a + b, 0);
+    const low = v.filter(x => x < okMin).length;
+    const high = v.filter(x => x > okMax).length;
+    const ok = n - low - high;
+    return {
+      avg: sum / n, min: Math.min(...v), max: Math.max(...v), n: n,
+      lowPct: Math.round(low * 100 / n),
+      highPct: Math.round(high * 100 / n),
+      okPct: Math.round(ok * 100 / n)
+    };
+  }
+
+  function renderStats(boxId, s, dec, unit) {
+    const box = document.getElementById(boxId);
+    if (!s) { box.innerHTML = '<div class="sub">No valid readings yet.</div>'; return; }
+    box.innerHTML =
+      '<div class="stat-grid">' +
+        '<div class="stat"><div class="k">Average</div><div class="v">' + s.avg.toFixed(dec) + '</div></div>' +
+        '<div class="stat"><div class="k">Minimum</div><div class="v">' + s.min.toFixed(dec) + '</div></div>' +
+        '<div class="stat"><div class="k">Maximum</div><div class="v">' + s.max.toFixed(dec) + '</div></div>' +
+      '</div>' +
+      '<div class="bar"><span class="lo" style="width:' + s.lowPct + '%"></span>' +
+        '<span class="ok" style="width:' + s.okPct + '%"></span>' +
+        '<span class="hi" style="width:' + s.highPct + '%"></span></div>' +
+      '<div class="legend">' +
+        '<span>Below normal: <b>' + s.lowPct + '%</b></span>' +
+        '<span>Normal: <b>' + s.okPct + '%</b></span>' +
+        '<span>Above normal: <b>' + s.highPct + '%</b></span>' +
+      '</div>' +
+      '<div class="sub" style="margin-top:8px">Based on ' + s.n + ' readings (' + unit + ')</div>';
+  }
+
+  function rowStatus(b, t) {
+    if (b < 30) return 'MEASURING';
+    return (b >= BPM_MIN && b <= BPM_MAX && t >= TEMP_MIN && t <= TEMP_MAX) ? 'NORMAL' : 'ABNORMAL';
+  }
+
+  function renderHistory(d) {
+    lastHist = d;
+    drawChart('bpmChart', d.bpm,  { lo: 40, hi: 140, okMin: BPM_MIN,  okMax: BPM_MAX,  minValid: 30, color: '#ffd166', dec: 0, axisDec: 0 });
+    drawChart('tempChart', d.temp, { lo: 60, hi: 110,  okMin: TEMP_MIN, okMax: TEMP_MAX, minValid: 1,  color: '#4cc9f0', dec: 1, axisDec: 1 });
+
+    const lastB = d.bpm.length ? d.bpm[d.bpm.length - 1] : 0;
+    const lastT = d.temp.length ? d.temp[d.temp.length - 1] : 0;
+    setText('bpmNow', lastB >= 30 ? Math.round(lastB) + ' BPM' : '-- BPM');
+    setText('tempNow', lastT >= 1 ? lastT.toFixed(1) + ' \u00B0C' : '-- \u00B0C');
+
+    renderStats('bpmStats',  analyse(d.bpm, 30, BPM_MIN, BPM_MAX),   0, 'BPM');
+    renderStats('tempStats', analyse(d.temp, 1, TEMP_MIN, TEMP_MAX), 1, '\u00B0C');
+
+    // Recent readings: last 30 seconds, newest first
+    let rows = '';
+    for (let k = d.bpm.length - 1; k >= 0 && k >= d.bpm.length - 30; k--) {
+      const sec = d.bpm.length - 1 - k;
+      const bv = d.bpm[k], tv = d.temp[k];
+      const st = rowStatus(bv, tv);
+      rows += '<tr><td>' + (sec === 0 ? 'Now' : sec + 's ago') + '</td>' +
+              '<td>' + (bv >= 30 ? Math.round(bv) : '--') + '</td>' +
+              '<td>' + (tv >= 1 ? tv.toFixed(1) : '--') + '</td>' +
+              '<td><span class="chip ' + st.toLowerCase() + '">' + st + '</span></td></tr>';
+    }
+    document.getElementById('readings').innerHTML = rows;
+  }
+
+  // ---------- Live data ----------
+  function setLive(ok) {
+    document.getElementById('liveDot').className = ok ? 'dot' : 'dot off';
+    setText('liveText', ok ? 'LIVE' : 'DISCONNECTED');
+  }
+
+  function updateData() {
+    fetch('/data').then(r => r.json()).then(d => {
+      setLive(true);
+      const b = d.bpm, t = d.temp;
+      setText('bpm', b > 30 ? Math.round(b) : '--');
+      setText('temp', t > 0 ? t.toFixed(1) : '--');
+
+      const box = document.getElementById('badgeBox');
+      const hint = document.getElementById('hint');
+      if (d.status === 'NORMAL') {
+        box.innerHTML = '<span class="badge normal">&#10004; NORMAL</span>';
+        hint.innerText = 'All readings are within the normal range';
+      } else if (d.status === 'ABNORMAL') {
+        box.innerHTML = '<span class="badge abnormal">&#9888; ABNORMAL</span>';
+        const p = [];
+        if (b > 30 && b < BPM_MIN) p.push('Heart rate is low');
+        if (b > BPM_MAX) p.push('Heart rate is high');
+        if (t > 0 && t < TEMP_MIN) p.push('Temperature is low');
+        if (t > TEMP_MAX) p.push('Temperature is high (possible fever)');
+        hint.innerText = p.length ? p.join('  \u2022  ') : 'Readings are outside the normal range';
+      } else {
+        box.innerHTML = '<span class="badge measuring">MEASURING...</span>';
+        hint.innerText = 'Place your finger on the pulse sensor';
+      }
+    }).catch(e => { setLive(false); console.error(e); });
+  }
+
+  function updateHistory() {
+    fetch('/history').then(r => r.json()).then(renderHistory).catch(e => console.error(e));
+  }
+
+  window.addEventListener('resize', function() { if (lastHist) renderHistory(lastHist); });
+
+  setInterval(updateData, 1000);
+  setInterval(updateHistory, 2000);
+  updateData();
+  updateHistory();
+</script>
 </body>
 </html>
 )rawliteral";
@@ -178,20 +537,39 @@ void handleData() {
   server.send(200, "application/json", json);
 }
 
-// ================= Read LM35 through LM741 (3x Gain) =================
-float readTemperature() {
-  long sumMilliVolts = 0;
-  for (int i = 0; i < 20; i++) {
-    sumMilliVolts += analogReadMilliVolts(LM35_AMP_PIN);
-    delay(2);
+// Last 60 seconds of BPM and temperature, oldest first
+void handleHistory() {
+  String json;
+  json.reserve(700);
+  int start = (histHead - histCount + HIST) % HIST;
+
+  json = "{\"bpm\":[";
+  for (int i = 0; i < histCount; i++) {
+    int idx = (start + i) % HIST;
+    if (i) json += ",";
+    json += String(bpmHist[idx], 0);
   }
-  float avgMilliVolts = (float)sumMilliVolts / 20.0;
-  return avgMilliVolts / 30.0;
+  json += "],\"temp\":[";
+  for (int i = 0; i < histCount; i++) {
+    int idx = (start + i) % HIST;
+    if (i) json += ",";
+    json += String(tempHist[idx], 1);
+  }
+  json += "]}";
+  server.send(200, "application/json", json);
+}
+
+// ================= SIMULATED TEMPERATURE (PCB UNCHANGED) =================
+// DEMONSTRATION ONLY: these are simulated values, NOT actual body temperature.
+// Values vary between 70.0 and 105.0 °C for software/project testing.
+float readTemperature() {
+  return random(700, 1051) / 10.0;
 }
 
 void setup() {
   // Start Serial Monitor immediately
   Serial.begin(115200);
+  randomSeed(esp_random()); // Seed simulated temperature variation
   delay(1500); // Allow USB-Serial connection to stabilize
   Serial.println("\n=========================================");
   Serial.println("  ESP32 HEALTH MONITOR INITIALIZING...   ");
@@ -224,7 +602,15 @@ void setup() {
 
     server.on("/", handleRoot);
     server.on("/data", handleData);
+    server.on("/history", handleHistory);
     server.begin();
+
+    // Telegram startup message
+    String startMsg = "✅ Patient monitor is online\n";
+    startMsg += "📊 Live Dashboard, Graphs & Analysis\n";
+    startMsg += "http://" + WiFi.localIP().toString() + "/";
+    sendTelegramMessage(startMsg);
+    lastTelegramTime = millis();
   } else {
     Serial.println("\n[WARN] WiFi connection timed out (Wrong SSID/Password or out of range).");
     Serial.println("[INFO] Running in Serial-Only Mode without freezing!");
@@ -290,30 +676,42 @@ void loop() {
       bool isBpmNormal  = (smoothedBPM >= BPM_NORMAL_MIN && smoothedBPM <= BPM_NORMAL_MAX);
 
       if (isTempNormal && isBpmNormal) {
-        healthStatus = "GOOD";
+        healthStatus = "NORMAL";
       } else {
-        healthStatus = "BAD";
+        healthStatus = "ABNORMAL";
       }
     } else {
-      healthStatus = "WAITING";
+      healthStatus = "MEASURING";
     }
+
+    // Save BPM and temperature for the dashboard graphs
+    bpmHist[histHead] = smoothedBPM;
+    tempHist[histHead] = temperatureC;
+    histHead = (histHead + 1) % HIST;
+    if (histCount < HIST) histCount++;
 
     // Always print to Serial Monitor
     Serial.print("Raw Pulse: "); Serial.print(rawPulse);
     Serial.print(" | Threshold: "); Serial.print(dynamicThreshold);
     Serial.print(" | BPM: "); Serial.print(smoothedBPM > 0 ? String(smoothedBPM, 0) : "--");
-    Serial.print(" | Temp: "); Serial.print(temperatureC, 1);
+    Serial.print(" | Temp (SIMULATED): "); Serial.print(temperatureC, 1);
     Serial.print(" °C | Status: "); Serial.println(healthStatus);
   }
 
   // 3. Play Normal Buzzer Alarms every 4 seconds based on status
   if (millis() - lastBuzzerCheck >= 4000) {
     lastBuzzerCheck = millis();
-    if (healthStatus == "GOOD") {
+    if (healthStatus == "NORMAL") {
       playGoodTune(); // 2 short pleasant beeps
-    } else if (healthStatus == "BAD") {
+    } else if (healthStatus == "ABNORMAL") {
       playBadTune();  // 3 urgent medical alert beeps
     }
+  }
+
+  // 4. Send Telegram update every 40 seconds (always)
+  if (wifiConnected && (millis() - lastTelegramTime >= TELEGRAM_INTERVAL)) {
+    lastTelegramTime = millis();
+    sendHealthUpdate();
   }
 
   delay(15);
